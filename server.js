@@ -1,30 +1,35 @@
+
 const express = require("express");
 const cors = require("cors");
-const fs = require("fs/promises");
-const path = require("path");
 const crypto = require("crypto");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const SCORES_FILE = path.join(__dirname, "scores.json");
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 app.use(
   cors({
     origin: function (origin, callback) {
-      // Allow requests with no origin (like mobile apps or curl)
       if (!origin) return callback(null, true);
-      // Allow any localhost origin for development
+
       if (/^http:\/\/localhost(:\d+)?$/.test(origin)) {
         return callback(null, true);
       }
-      // Allow configured production origin
-      if (process.env.FRONTEND_ORIGIN && origin === process.env.FRONTEND_ORIGIN) {
+
+      if (
+        process.env.FRONTEND_ORIGIN &&
+        origin === process.env.FRONTEND_ORIGIN
+      ) {
         return callback(null, true);
       }
+
       callback(new Error("Not allowed by CORS"));
     },
   })
 );
+
 app.use(express.json({ limit: "20kb" }));
 
 const questions = [
@@ -70,45 +75,39 @@ const questions = [
   },
 ];
 
-let writeQueue = Promise.resolve();
-
-async function readScores() {
-  try {
-    const content = await fs.readFile(SCORES_FILE, "utf8");
-    const data = JSON.parse(content);
-
-    if (!Array.isArray(data)) {
-      throw new Error("scores.json must contain an array.");
-    }
-
-    return data;
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      await fs.writeFile(SCORES_FILE, "[]", "utf8");
-      return [];
-    }
-    throw error;
+// Check server-side Supabase configuration.
+function checkSupabaseConfig() {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error("Supabase environment variables are not configured.");
   }
 }
 
-function saveScore(record) {
-  const operation = writeQueue.then(async () => {
-    const scores = await readScores();
-    scores.push(record);
+// Make authenticated requests to Supabase REST API.
+async function supabaseRequest(endpoint, options = {}) {
+  checkSupabaseConfig();
 
-    const tempFile = `${SCORES_FILE}.tmp`;
+  const baseUrl = SUPABASE_URL.replace(/\/+$/, "");
 
-    await fs.writeFile(
-      tempFile,
-      JSON.stringify(scores, null, 2),
-      "utf8"
-    );
-
-    await fs.rename(tempFile, SCORES_FILE);
+  const response = await fetch(`${baseUrl}/rest/v1/${endpoint}`, {
+    ...options,
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
   });
 
-  writeQueue = operation.catch(() => {});
-  return operation;
+  if (!response.ok) {
+    const details = await response.text();
+    throw new Error(`Supabase error (${response.status}): ${details}`);
+  }
+
+  if (response.status === 204) {
+    return null;
+  }
+
+  return response.json();
 }
 
 function sortScores(scores) {
@@ -132,28 +131,35 @@ app.get("/api/questions", (req, res) => {
   );
 });
 
+// Load the shared leaderboard from Supabase.
 app.get("/api/scores", async (req, res) => {
   try {
-    await writeQueue;
-    const scores = await readScores();
+    const query = new URLSearchParams({
+      select: "id,name,score,total,created_at",
+      order: "score.desc,created_at.asc",
+      limit: "100",
+    });
 
-    const publicScores = scores.map(
-      ({ id, name, score, total, createdAt }) => ({
+    const rows = await supabaseRequest(`scores?${query.toString()}`);
+
+    const publicScores = rows.map(
+      ({ id, name, score, total, created_at }) => ({
         id,
         name,
         score,
         total,
-        createdAt,
+        createdAt: created_at,
       })
     );
 
-    res.json(sortScores(publicScores).slice(0, 100));
+    res.json(sortScores(publicScores));
   } catch (error) {
     console.error("Read scores error:", error);
     res.status(500).json({ error: "Could not load scores." });
   }
 });
 
+// Validate answers, calculate the score, and save it to Supabase.
 app.post("/api/scores", async (req, res) => {
   try {
     const name =
@@ -214,15 +220,29 @@ app.post("/api/scores", async (req, res) => {
       0
     );
 
+    const createdAt = new Date().toISOString();
+
     const record = {
       id: crypto.randomUUID(),
       name,
       score,
       total: questions.length,
-      createdAt: new Date().toISOString(),
+      createdAt,
     };
 
-    await saveScore(record);
+    await supabaseRequest("scores", {
+      method: "POST",
+      headers: {
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify({
+        id: record.id,
+        name: record.name,
+        score: record.score,
+        total: record.total,
+        created_at: record.createdAt,
+      }),
+    });
 
     res.status(201).json({
       message: "Score saved successfully!",
@@ -237,3 +257,5 @@ app.post("/api/scores", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Birthday Quiz API running at http://localhost:${PORT}`);
 });
+
+module.exports = app;
