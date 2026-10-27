@@ -7,17 +7,24 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_SERVICE_ROLE_KEY =
+  process.env.SUPABASE_SERVICE_ROLE_KEY;
 
+// Allowed frontend origins.
+const allowedOrigins = [
+  "https://quiz-frontend-rho.vercel.app",
+  "http://localhost:5173",
+];
+
+// CORS configuration — keep this before the API routes.
 app.use(
   cors({
-    origin: function (origin, callback) {
-      if (!origin) return callback(null, true);
-
-      if (/^http:\/\/localhost(:\d+)?$/.test(origin)) {
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin)) {
         return callback(null, true);
       }
 
+      // Also allow a configured frontend URL from Vercel.
       if (
         process.env.FRONTEND_ORIGIN &&
         origin === process.env.FRONTEND_ORIGIN
@@ -25,8 +32,12 @@ app.use(
         return callback(null, true);
       }
 
-      callback(new Error("Not allowed by CORS"));
+      return callback(
+        new Error(`Not allowed by CORS: ${origin}`)
+      );
     },
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
@@ -47,13 +58,23 @@ const questions = [
   {
     id: "q2",
     question: "Which item is commonly used at birthday parties?",
-    options: ["Umbrella", "Birthday cake", "School bag", "Passport"],
+    options: [
+      "Umbrella",
+      "Birthday cake",
+      "School bag",
+      "Passport",
+    ],
     correctIndex: 1,
   },
   {
     id: "q3",
     question: "What do people usually blow out on a birthday cake?",
-    options: ["Balloons", "Flowers", "Candles", "Ribbons"],
+    options: [
+      "Balloons",
+      "Flowers",
+      "Candles",
+      "Ribbons",
+    ],
     correctIndex: 2,
   },
   {
@@ -70,7 +91,12 @@ const questions = [
   {
     id: "q5",
     question: "Which of these is a common birthday gift?",
-    options: ["A present", "A parking ticket", "A bill", "A timetable"],
+    options: [
+      "A present",
+      "A parking ticket",
+      "A bill",
+      "A timetable",
+    ],
     correctIndex: 0,
   },
 ];
@@ -78,49 +104,75 @@ const questions = [
 // Check server-side Supabase configuration.
 function checkSupabaseConfig() {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-    throw new Error("Supabase environment variables are not configured.");
+    throw new Error(
+      "Supabase environment variables are not configured."
+    );
   }
 }
 
-// Make authenticated requests to Supabase REST API.
+// Make authenticated requests to the Supabase REST API.
+// Safely handles empty response bodies.
 async function supabaseRequest(endpoint, options = {}) {
   checkSupabaseConfig();
 
   const baseUrl = SUPABASE_URL.replace(/\/+$/, "");
 
-  const response = await fetch(`${baseUrl}/rest/v1/${endpoint}`, {
-    ...options,
-    headers: {
-      apikey: SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-      ...options.headers,
-    },
-  });
+  const response = await fetch(
+    `${baseUrl}/rest/v1/${endpoint}`,
+    {
+      ...options,
+      headers: {
+        apikey: SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        "Content-Type": "application/json",
+        ...options.headers,
+      },
+    }
+  );
+
+  const responseText = await response.text();
 
   if (!response.ok) {
-    const details = await response.text();
-    throw new Error(`Supabase error (${response.status}): ${details}`);
+    throw new Error(
+      `Supabase error (${response.status}): ${
+        responseText || response.statusText
+      }`
+    );
   }
 
-  if (response.status === 204) {
+  // Supabase may return no body with Prefer: return=minimal.
+  if (!responseText.trim()) {
     return null;
   }
 
-  return response.json();
+  try {
+    return JSON.parse(responseText);
+  } catch {
+    throw new Error(
+      "Supabase returned a response that was not valid JSON."
+    );
+  }
 }
 
+// Sort by highest score first, then earliest submission.
 function sortScores(scores) {
   return scores.sort((a, b) => {
-    if (b.score !== a.score) return b.score - a.score;
-    return new Date(a.createdAt) - new Date(b.createdAt);
+    if (b.score !== a.score) {
+      return b.score - a.score;
+    }
+
+    return (
+      new Date(a.createdAt) - new Date(b.createdAt)
+    );
   });
 }
 
+// Health check.
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
+// Return quiz questions without revealing correct answers.
 app.get("/api/questions", (req, res) => {
   res.json(
     questions.map(({ id, question, options }) => ({
@@ -140,7 +192,16 @@ app.get("/api/scores", async (req, res) => {
       limit: "100",
     });
 
-    const rows = await supabaseRequest(`scores?${query.toString()}`);
+    const rows = await supabaseRequest(
+      `scores?${query.toString()}`
+    );
+
+    // Protect against an unexpected empty/non-array result.
+    if (!Array.isArray(rows)) {
+      throw new Error(
+        "Supabase did not return a score list."
+      );
+    }
 
     const publicScores = rows.map(
       ({ id, name, score, total, created_at }) => ({
@@ -155,19 +216,22 @@ app.get("/api/scores", async (req, res) => {
     res.json(sortScores(publicScores));
   } catch (error) {
     console.error("Read scores error:", error);
-    res.status(500).json({ error: "Could not load scores." });
+
+    res.status(500).json({
+      error: "Could not load scores.",
+    });
   }
 });
 
-// Validate answers, calculate the score, and save it to Supabase.
+// Validate answers, calculate the score, and save it.
 app.post("/api/scores", async (req, res) => {
   try {
     const name =
-      typeof req.body.name === "string"
+      typeof req.body?.name === "string"
         ? req.body.name.trim().replace(/\s+/g, " ")
         : "";
 
-    const answers = req.body.answers;
+    const answers = req.body?.answers;
 
     if (!name || name.length > 40) {
       return res.status(400).json({
@@ -185,7 +249,10 @@ app.post("/api/scores", async (req, res) => {
       });
     }
 
-    const questionIds = questions.map((q) => q.id);
+    const questionIds = questions.map(
+      (question) => question.id
+    );
+
     const submittedIds = Object.keys(answers);
 
     if (
@@ -199,6 +266,7 @@ app.post("/api/scores", async (req, res) => {
       });
     }
 
+    // Validate each submitted answer.
     for (const question of questions) {
       const answer = answers[question.id];
 
@@ -213,10 +281,13 @@ app.post("/api/scores", async (req, res) => {
       }
     }
 
+    // Calculate the score on the server.
     const score = questions.reduce(
       (total, question) =>
         total +
-        (answers[question.id] === question.correctIndex ? 1 : 0),
+        (answers[question.id] === question.correctIndex
+          ? 1
+          : 0),
       0
     );
 
@@ -230,6 +301,7 @@ app.post("/api/scores", async (req, res) => {
       createdAt,
     };
 
+    // Save the score to Supabase.
     await supabaseRequest("scores", {
       method: "POST",
       headers: {
@@ -244,18 +316,42 @@ app.post("/api/scores", async (req, res) => {
       }),
     });
 
-    res.status(201).json({
+    return res.status(201).json({
       message: "Score saved successfully!",
       result: record,
     });
   } catch (error) {
     console.error("Save score error:", error);
-    res.status(500).json({ error: "Could not save your score." });
+
+    return res.status(500).json({
+      error: "Could not save your score.",
+    });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Birthday Quiz API running at http://localhost:${PORT}`);
+// Handle CORS errors with a clear response.
+app.use((err, req, res, next) => {
+  if (err.message?.startsWith("Not allowed by CORS")) {
+    return res.status(403).json({
+      error: "This origin is not allowed.",
+    });
+  }
+
+  console.error("Server error:", err);
+
+  return res.status(500).json({
+    error: "Internal server error.",
+  });
 });
+
+// Local development server.
+// Vercel can import the Express app as a serverless function.
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(
+      `Birthday Quiz API running at http://localhost:${PORT}`
+    );
+  });
+}
 
 module.exports = app;
